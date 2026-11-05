@@ -9,6 +9,8 @@
 #
 # Options:
 #   --status   show the CPU, its driver and current settings (changes nothing)
+#   --compare  measure the three profiles on this CPU (about a minute) and
+#              show the results; the current settings are put back after
 #   --undo     put back the settings the host had before this script
 #   --help
 #
@@ -385,6 +387,171 @@ cmd_undo() {
   say_ok "Restored governor ${ORIG_GOVERNOR}${ORIG_EPP:+, preference ${ORIG_EPP}}, turbo ${ORIG_TURBO}; boot service removed"
 }
 
+# ---- comparing the profiles on this CPU ------------------------------------------
+#
+# Applies each profile for a moment and measures it: CPU package power at
+# the current load (if the CPU reports it, via RAPL) and the speed one busy
+# core reaches. Each profile is measured twice, interleaved, so changes in
+# background load affect all of them alike. The host's own settings are
+# always put back afterwards, also on Ctrl-C or an error.
+
+CMP_ACTIVE=0
+CMP_TABLE=""
+CMP_HINT=""
+CMP_BEST=""
+CMP_SAVED_GOV="" CMP_SAVED_EPP="" CMP_SAVED_TURBO=""
+
+has_rapl() { [[ -r /sys/class/powercap/intel-rapl:0/energy_uj ]]; }
+
+rapl_mw() {   # <seconds> -> average package power in milliwatts
+  local f=/sys/class/powercap/intel-rapl:0/energy_uj e1 e2 max
+  e1=$(cat "$f"); sleep "$1"; e2=$(cat "$f")
+  if (( e2 < e1 )); then
+    max=$(cat /sys/class/powercap/intel-rapl:0/max_energy_range_uj 2>/dev/null || echo 0)
+    e2=$(( e2 + max ))
+  fi
+  printf '%d' $(( (e2 - e1) / $1 / 1000 ))
+}
+
+fastest_cpu() {   # -> the CPU with the highest top speed (a P-core on hybrid CPUs)
+  local f v n best=-1 cpu=0
+  for f in "${SYS_CPU}"/cpu[0-9]*/cpufreq/cpuinfo_max_freq; do
+    v=$(cat "$f" 2>/dev/null || echo 0)
+    if (( v > best )); then
+      best=$v
+      n=${f#"${SYS_CPU}/cpu"}
+      cpu=${n%%/*}
+    fi
+  done
+  printf '%s' "$cpu"
+}
+
+boost_mhz() {   # <cpu> -> highest speed (MHz) it reached while kept busy for ~3 s
+  local c=$1 pid max=0 v i
+  # shellcheck disable=SC2016  # the loop runs in its own shell
+  taskset -c "$c" bash -c 'end=$((SECONDS + 4)); while (( SECONDS < end )); do :; done' &
+  pid=$!
+  sleep 0.5
+  for (( i = 0; i < 12; i++ )); do
+    v=$(cat "${SYS_CPU}/cpu${c}/cpufreq/scaling_cur_freq" 2>/dev/null || echo 0)
+    if (( v > max )); then max=$v; fi
+    sleep 0.25
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  printf '%d' $(( max / 1000 ))
+}
+
+running_guests() {   # -> "1 VM, 2 containers running" / "no VMs or containers running"
+  local vms cts
+  vms=$(qm list 2>/dev/null | awk 'NR > 1 && $3 == "running"' | wc -l)
+  cts=$(pct list 2>/dev/null | awk 'NR > 1 && $2 == "running"' | wc -l)
+  if (( vms + cts == 0 )); then
+    printf 'no VMs or containers running'
+  else
+    printf '%d VM%s, %d container%s running' "$vms" "$([[ $vms == 1 ]] || printf s)" "$cts" "$([[ $cts == 1 ]] || printf s)"
+  fi
+}
+
+cmp_restore() {
+  (( CMP_ACTIVE )) || return 0
+  CMP_ACTIVE=0
+  apply_values "$CMP_SAVED_GOV" \
+    "$( [[ -n "$CMP_SAVED_EPP" && "$CMP_SAVED_GOV" != performance ]] && printf '%s' "$CMP_SAVED_EPP" || printf -- '-')" \
+    "$CMP_SAVED_TURBO"
+  log_line "Compare: restored governor=${CMP_SAVED_GOV} epp=${CMP_SAVED_EPP} turbo=${CMP_SAVED_TURBO}"
+}
+
+# Called by rcp_fail (core.func) on errors and Ctrl-C.
+rcp_on_failure() {
+  if (( CMP_ACTIVE )); then
+    cmp_restore
+    say "   Your original CPU settings were put back."
+  fi
+}
+
+pct_vs() {   # <value> <reference> -> " (-29%)" / " (+3%)" / ""
+  local d
+  (( $2 > 0 )) || return 0
+  d=$(( ($1 - $2) * 100 / $2 ))
+  (( d == 0 )) && return 0
+  if (( d > 0 )); then printf ' (+%d%%)' "$d"; else printf ' (%d%%)' "$d"; fi
+}
+
+compare_profiles() {   # sets CMP_TABLE, CMP_HINT and CMP_BEST
+  local p round c gov epp mw mhz turbo guests line
+  local -A sum_mw=() sum_mhz=()
+  c=$(fastest_cpu)
+  guests=$(running_guests)
+  turbo=$(turbo_state)
+  [[ "$turbo" == n/a ]] || turbo=on
+  CMP_SAVED_GOV=$(cpu_governor)
+  CMP_SAVED_EPP=$(cpu_epp || true)
+  CMP_SAVED_TURBO=$(turbo_state)
+  CMP_ACTIVE=1
+  log_line "Compare: start (cpu ${c}, ${guests}; saved governor=${CMP_SAVED_GOV} epp=${CMP_SAVED_EPP} turbo=${CMP_SAVED_TURBO})"
+  say "   Comparing the profiles on this CPU (about a minute). Your settings are put back afterwards."
+  for round in 1 2; do
+    for p in performance balanced powersave; do
+      say "   Measuring $(profile_label "$p") (round ${round} of 2)..."
+      read -r gov epp < <(profile_plan "$p"; echo) || true
+      apply_values "$gov" "$epp" "$turbo"
+      sleep 3
+      mw=0
+      if has_rapl; then mw=$(rapl_mw 5); fi
+      mhz=$(boost_mhz "$c")
+      sum_mw[$p]=$(( ${sum_mw[$p]:-0} + mw ))
+      sum_mhz[$p]=$(( ${sum_mhz[$p]:-0} + mhz ))
+      log_line "Compare: ${p} round ${round}: ${mw} mW, ${mhz} MHz"
+    done
+  done
+  cmp_restore
+  for p in performance balanced powersave; do
+    sum_mw[$p]=$(( sum_mw[$p] / 2 ))
+    sum_mhz[$p]=$(( sum_mhz[$p] / 2 ))
+  done
+
+  CMP_TABLE="Measured on your $(cpu_model)
+(at the current load: ${guests})
+
+                 Idle power        One busy core"
+  for p in performance balanced powersave; do
+    if has_rapl; then
+      line="$(awk -v m="${sum_mw[$p]}" 'BEGIN { printf "%.1f W", m / 1000 }')$(pct_vs "${sum_mw[$p]}" "${sum_mw[performance]}")"
+    else
+      line="not reported"
+    fi
+    CMP_TABLE+=$(printf '\n %-14s  %-16s  %s GHz%s' "$(profile_label "$p")" "$line" \
+      "$(awk -v m="${sum_mhz[$p]}" 'BEGIN { printf "%.1f", m / 1000 }')" "$(pct_vs "${sum_mhz[$p]}" "${sum_mhz[performance]}")")
+  done
+
+  CMP_TABLE+="
+Differences of a few percent are normal run-to-run variation."
+
+  # A plain-language hint when the numbers point clearly one way.
+  local pw=${sum_mw[performance]} bw=${sum_mw[balanced]} pf=${sum_mhz[performance]} bf=${sum_mhz[balanced]}
+  CMP_BEST=performance
+  CMP_HINT="The profiles made little difference on this CPU at this load; Performance (the default) is fine."
+  if has_rapl && (( pw > 0 && bw * 100 <= pw * 90 && bf * 100 >= pf * 97 )); then
+    CMP_BEST=balanced
+    CMP_HINT="Balanced used $(( (pw - bw) * 100 / pw ))% less power here with no loss in top speed: a good choice for a host that runs all the time."
+  elif ! has_rapl && (( bf * 100 >= pf * 97 )); then
+    CMP_BEST=balanced
+    CMP_HINT="This CPU doesn't report its power, but Balanced reached the same top speed here, and it normally idles cooler."
+  fi
+  log_line "Compare: result best=${CMP_BEST}"
+}
+
+cmd_compare() {
+  preflight_checks
+  [[ -n "$(cpu_driver)" ]] || die "This host has no CPU frequency driver (cpufreq), so there is nothing to compare."
+  compare_profiles
+  say_head "Profile comparison"
+  printf '%s\n\n' "$CMP_TABLE" | sed 's/^/  /'
+  say "  ${CMP_HINT}"
+  say "  Your CPU settings are unchanged. To pick one, run this script without options."
+}
+
 valid_profile() { [[ "$1" == performance || "$1" == balanced || "$1" == powersave ]]; }
 
 cmd_apply() {
@@ -422,10 +589,27 @@ The CPU already changes each core's speed with the load. A profile sets how eage
     if (( ${#hist[@]} )); then UI_BACK_LABEL=Back; else UI_BACK_LABEL=Exit; fi
     case $step in
       profile)
-        if ui_menu CPU_PROFILE "Which profile?" "${current:-balanced}" \
+        local -a extra=(compare "Compare: measure all three on this CPU first (about a minute)")
+        local prompt="Which profile?"
+        if [[ -n "$CMP_TABLE" ]]; then
+          extra=()
+          prompt="${CMP_TABLE}
+
+${CMP_HINT}
+
+Which profile?"
+        fi
+        if ui_menu CPU_PROFILE "$prompt" "${CMP_BEST:-${current:-balanced}}" \
           performance "Performance: fastest response, most power (Proxmox default)" \
           balanced    "Balanced: full speed under load, cooler and cheaper at idle" \
-          powersave   "Power saver: lowest power and heat, slower to boost"; then
+          powersave   "Power saver: lowest power and heat, slower to boost" \
+          "${extra[@]}"; then
+          if [[ "$CPU_PROFILE" == compare ]]; then
+            unset CPU_PROFILE
+            if (( RCP_TTY )); then clear; fi
+            compare_profiles
+            continue
+          fi
           valid_profile "$CPU_PROFILE" || die "CPU_PROFILE must be performance, balanced or powersave."
           cg_next turbo
         else
@@ -484,6 +668,8 @@ reboots, or undo it.
 
   (no option)  show the CPU, then choose Performance, Balanced or Power saver
   --status     show the CPU, driver, settings, power and microcode (read-only)
+  --compare    measure Performance, Balanced and Power saver on this CPU
+               (about a minute), then put the current settings back
   --undo       restore the settings from before this script and remove its
                boot service
 
@@ -500,6 +686,7 @@ main() {
   log_line "==== cpu-governor ${1:-} ===="
   case "${1:-}" in
     --status) cmd_status ;;
+    --compare) cmd_compare ;;
     --undo)
       (( EUID == 0 )) || die "Run this as root on the Proxmox VE host."
       cmd_undo ;;
