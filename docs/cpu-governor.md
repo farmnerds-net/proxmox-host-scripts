@@ -41,16 +41,40 @@ With Intel and AMD's active drivers, the `powersave` governor does **not**
 mean slow: the CPU still picks its own speed, up to full turbo. The
 preference only changes how readily it does.
 
-Measured on an Intel Core i9-14900KS host (idle, CPU package power, and
-the speed one busy performance core reached):
+### Compare them on your own CPU
 
-| | Performance | Balanced | Power saver, turbo off |
-| --- | --- | --- | --- |
-| Idle power | 14 W | 10 W | 10 W |
-| One busy core | 4.9 GHz | 5.9 GHz | 3.2 GHz (base clock) |
+How much a profile saves differs a lot from one CPU model to another, so
+the script can **measure all three on your CPU** before you choose: pick
+**Compare** in the profile menu, or run it with `--compare`. It takes
+about a minute, and your settings are put back afterwards (also if you
+press Ctrl-C). The profile menu then shows the results, for example:
 
-Your numbers will differ; the script shows the power before and after
-applying a profile on CPUs that report it.
+```
+ Measured on your Intel(R) Core(TM) i9-14900KS
+ (at the current load: no VMs or containers running)
+
+                  Idle power        One busy core
+  Performance     14.9 W            6.1 GHz
+  Balanced        11.3 W (-23%)     6.1 GHz
+  Power saver     11.5 W (-22%)     6.1 GHz
+ Differences of a few percent are normal run-to-run variation.
+
+ Balanced used 23% less power here with no loss in top speed: a good choice
+ for a host that runs all the time.
+```
+
+- **Idle power** is the CPU package power at the current load, from the
+  CPU's own energy counter (RAPL: Intel since about 2011, AMD since Zen).
+  CPUs that don't have one show "not reported", and you still get the
+  speed column.
+- **One busy core** is the top speed the fastest core reached while kept
+  busy for a few seconds.
+- Each profile is measured twice, interleaved, so changes in background
+  load affect them alike. Anything else running on the host (VMs,
+  containers) still adds to the power numbers, so the table says what was
+  running. For the clearest numbers, compare when the host is quiet.
+- When the numbers point clearly one way, it says so, and that profile is
+  pre-selected.
 
 ## Using it
 
@@ -58,7 +82,8 @@ applying a profile on CPUs that report it.
    cores on hybrid Intel CPUs), speed range and current speeds, the driver,
    governor and preference, turbo, temperature, CPU power, microcode, and
    any profile it has set before.
-2. Pick a profile, then whether to allow turbo.
+2. Pick a profile (or **Compare** first, see above), then whether to allow
+   turbo.
 3. Confirm. It applies the profile to every core right away and installs a
    small boot service (`proxmox-host-scripts-cpu-governor.service`) that
    applies it again after every reboot.
@@ -89,7 +114,8 @@ Undo puts exactly those back and removes the boot service and its files.
 ## Other options
 
 ```bash
-cpu-governor.sh --status   # everything it detects, plus the current profile; changes nothing
+cpu-governor.sh --status    # everything it detects, plus the current profile; changes nothing
+cpu-governor.sh --compare   # measure the three profiles here; puts your settings back after
 cpu-governor.sh --help
 ```
 

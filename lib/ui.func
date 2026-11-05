@@ -44,10 +44,12 @@ ui_menu() {   # <var> <prompt> <default tag> <tag> <description> [...]
   shift 3
   if ui_is_set "$var"; then return 0; fi
   ui_need_tty "$var"
+  local lines
   rows=$(( $# / 2 ))
   (( rows > 14 )) && rows=14
+  lines=$(printf '%s\n' "$prompt" | wc -l)
   value=$(whiptail --title "$UI_TITLE" --cancel-button "$UI_BACK_LABEL" --default-item "$def" \
-    --menu "$prompt" $(( rows + 9 )) 78 "$rows" "$@" 3>&1 1>&2 2>&3) || return 1
+    --menu "$prompt" $(( rows + 7 + lines )) 78 "$rows" "$@" 3>&1 1>&2 2>&3) || return 1
   printf -v "$var" '%s' "$value"
 }
 
