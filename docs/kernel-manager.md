@@ -11,8 +11,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/farmnerds-net/proxmox-ho
 Run it on the Proxmox host shell as root. It shows the report, then offers
 to **try a kernel for one boot**, **pin** or **unpin** one, all through
 Proxmox's own `proxmox-boot-tool`. **It never reboots the host**: changes
-take effect when you reboot. (Installing other kernel series and removing
-old kernels are coming next.)
+take effect when you reboot. It can also **install another kernel series**
+(checking its drivers first) and **remove old kernels**.
 
 For the report alone, which changes nothing:
 
@@ -98,14 +98,15 @@ For a driver-by-driver list of one installed kernel:
 kernel-manager.sh --check 7.0.14-26-pve
 ```
 
-Kernels that aren't installed can't be checked yet (their driver list is
-inside the package); that comes with installing other series.
+Kernels that aren't installed are checked before you install them: the
+script downloads the package and reads its driver list (see below).
 
 ## Cleanup suggestions
 
 Old kernel builds stay installed after updates (about 1 GB each). The
 report lists the ones that aren't running, pinned, next to boot or the
-fallback, and how much space removing them would free. Nothing is removed.
+fallback, and how much space removing them would free. The report itself
+removes nothing; use **Remove old kernels** (below) for that.
 
 ## Trying, pinning and unpinning
 
@@ -120,6 +121,8 @@ get an extra warning before choosing one.
 | **Keep the running kernel** | Shown when you're running an older kernel (for example after a trial): pin it |
 | **Remove the pin** | Boot the newest kernel again and follow updates as usual |
 | **Cancel the next-boot trial** | Undo a trial you set but haven't rebooted into yet |
+| **Install another kernel series** | Add an older series as a fallback, or a newer opt-in one (see below) |
+| **Remove old kernels** | Free space by removing kernels you no longer need (see below) |
 
 After each change the script reads the boot loader's actual default from
 the boot partition and shows it, so you can see the change took.
@@ -154,3 +157,48 @@ kernel-manager.sh --cancel-try           # remove only the next-boot trial
 
 The kernel must be installed. Presets for the menus: `KM_ACTION`
 (`try`, `pin`, `keep`, `unpin`, `cancel-try`), `KM_KERNEL`, `KM_CONFIRM=yes`.
+
+## Installing another kernel series
+
+Pick a series from your repositories that isn't installed yet. Each is
+labelled **older, a fallback** or **OPT-IN, newer and less tested**, with
+its download size.
+
+1. **Opt-in series** first show what that means (newer than the default,
+   less tested, can have regressions with passthrough, ZFS, network cards or
+   graphics) and need you to confirm with **I understand** (No is the
+   default).
+2. **Driver check before installing:** the script downloads the kernel
+   package (about 110-125 MB) and checks it has every driver your devices
+   use. The result is on the confirmation screen.
+3. After installing, it asks **what the next boot should do**:
+   - An **older** series doesn't change your next boot. You can try it for
+     one boot, pin it, or leave it as a fallback.
+   - A **newer** series would become the default automatically (the newest
+     kernel boots). So you choose: **try it for the next boot only, then
+     return to your current kernel** (recommended: your current kernel is
+     pinned for that, unpin later with `--unpin`), boot it from now on, or
+     not yet (your current kernel stays pinned).
+
+Without a terminal (`--install 6.17` from a script), it never lets a new
+kernel boot by surprise: a newer one gets your current kernel pinned, an
+older one changes nothing.
+
+## Removing old kernels
+
+A checklist of the kernels that are safe to remove: not running, not next
+to boot, not pinned (also not for the next boot) and not the fallback. All
+are ticked; untick any you want to keep. Before removing anything, apt is
+asked in a dry run, and if it would remove any other package the script
+stops. It also removes the series' meta package once none of its kernels
+is left, and apt's cached downloads of what it removed.
+
+These are the same kernels Proxmox's own `apt autoremove` would remove.
+
+### Without menus
+
+```bash
+kernel-manager.sh --install 6.17                 # older series
+KM_OPTIN=yes kernel-manager.sh --install 7.1     # an opt-in series (example)
+kernel-manager.sh --remove 7.0.14-24-pve 7.0.14-25-pve
+```

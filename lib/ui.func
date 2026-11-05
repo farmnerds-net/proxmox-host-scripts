@@ -68,6 +68,20 @@ ui_input() {   # <var> <prompt> <default> <validator> <error text>
   done
 }
 
+# Sets <var> to the space-separated tags the user ticked (may be empty).
+ui_checklist() {   # <var> <prompt> <tag> <description> <on|off> [...]
+  local var=$1 prompt=$2 value rows lines
+  shift 2
+  if ui_is_set "$var"; then return 0; fi
+  ui_need_tty "$var"
+  rows=$(( $# / 3 ))
+  (( rows > 14 )) && rows=14
+  lines=$(printf '%s\n' "$prompt" | wc -l)
+  value=$(whiptail --title "$UI_TITLE" --cancel-button "$UI_BACK_LABEL" --separate-output \
+    --checklist "$prompt" $(( rows + 7 + lines )) 78 "$rows" "$@" 3>&1 1>&2 2>&3) || return 1
+  printf -v "$var" '%s' "$(printf '%s' "$value" | tr '\n' ' ' | sed 's/ $//')"
+}
+
 # Sets <var> to yes or no. Esc returns 1 without setting it.
 ui_yesno() {   # <var> <prompt> <default yes|no> [<yes label> <no label>]
   local var=$1 rc=0

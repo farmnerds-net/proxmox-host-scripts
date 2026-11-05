@@ -10,7 +10,8 @@
 # Without options it shows the report, then offers to try a kernel for
 # the next boot only, pin or unpin one, or cancel a trial. Changes go
 # through Proxmox's own proxmox-boot-tool, and the script never reboots.
-# (Installing other kernel series and removing old kernels come next.)
+# It can also install other kernel series (checking their drivers first)
+# and remove old kernels.
 #
 # Options:
 #   --report            the report only; changes nothing
@@ -20,10 +21,16 @@
 #   --pin <version>     keep booting <version>
 #   --unpin             remove the pin and any trial (boot the newest again)
 #   --cancel-try        remove only the next-boot trial
+#   --install <series>  install another kernel series, e.g. --install 6.17
+#                       (opt-in series also need KM_OPTIN=yes)
+#   --remove <version>... remove old kernels (only ones that aren't running,
+#                       next to boot, pinned or the fallback)
 #   --help
 #
-# Presets (each skips its question): KM_ACTION=try|pin|unpin|cancel-try|keep,
-# KM_KERNEL=<version>, KM_CONFIRM=yes
+# Presets (each skips its question):
+#   KM_ACTION=try|pin|keep|unpin|cancel-try|install|remove  KM_KERNEL=<version>
+#   KM_SERIES=<series>  KM_OPTIN=yes  KM_AFTER=try|default|hold|pin|none
+#   KM_REMOVE="<version> ..."  KM_CONFIRM=yes
 
 set -Eeuo pipefail
 
@@ -479,6 +486,348 @@ apply_action() {   # <action> [<abi>]
   fi
 }
 
+# ---- installing other kernel series --------------------------------------------------
+
+series_label() {   # <series> -> default | older | opt-in
+  local d
+  d=$(default_series)
+  if [[ "$1" == "$d" ]]; then printf 'default'
+  elif [[ "$(printf '%s\n%s\n' "$1" "$d" | sort -V | tail -n 1)" == "$1" ]]; then printf 'opt-in'
+  else printf 'older'; fi
+}
+
+series_installed() {   # <series>
+  [[ "$(dpkg-query -W -f '${db:Status-Abbrev}' "proxmox-kernel-$1" 2>/dev/null)" == ii* ]]
+}
+
+# The kernel package a series' meta package installs now, e.g.
+# proxmox-kernel-6.17.13-21-pve-signed (the signed one when there is one).
+series_kernel_pkg() {   # <series>
+  apt-cache depends "proxmox-kernel-$1" 2>/dev/null |
+    sed -n 's/^ *|\{0,1\}Depends: \(proxmox-kernel-[0-9][0-9.]*-[0-9]*-pve\(-signed\)\{0,1\}\)$/\1/p' |
+    sort -r | head -n 1
+}
+
+pkg_abi() { local p=${1#proxmox-kernel-}; printf '%s' "${p%-signed}"; }
+
+pkg_download_size() {   # <package> -> bytes
+  apt-cache show "$1" 2>/dev/null | sed -n 's/^Size: //p' | head -n 1
+}
+
+human_bytes() {
+  awk -v b="${1:-0}" 'BEGIN { split("B KB MB GB TB", u, " "); i = 1
+    while (b >= 1000 && i < 5) { b /= 1000; i++ }; printf (i >= 4 ? "%.1f %s" : "%d %s"), b, u[i] }'
+}
+
+# Download a kernel package (not installed) and read which drivers it has,
+# so hardware_check works on it before it's installed.
+precheck_package() {   # <package> <abi>
+  local tmp deb list
+  tmp=$(mktemp -d)
+  ( cd "$tmp" && apt-get -q -o APT::Sandbox::User=root download "$1" ) >>"$RCP_LOG" 2>&1 ||
+    { rm -rf -- "$tmp"; return 1; }
+  deb=$(find "$tmp" -maxdepth 1 -name '*.deb' | head -n 1)
+  [[ -n "$deb" ]] || { rm -rf -- "$tmp"; return 1; }
+  list=$(dpkg-deb --fsys-tarfile "$deb" | tar -t 2>/dev/null |
+    sed -n 's#.*/\([^/]*\)\.ko\(\.[a-z]*\)\{0,1\}$#\1#p')
+  list+=$'\n'$(dpkg-deb --fsys-tarfile "$deb" | tar -xO --wildcards "*/modules/$2/modules.builtin" 2>/dev/null |
+    sed 's#.*/##; s/\.ko.*$//')
+  KMODS[$2]=$(printf '%s\n' "$list" | sed 's/-/_/g' | sed '/^$/d' | sort -u)
+  rm -rf -- "$tmp"
+  [[ -n "${KMODS[$2]}" ]]
+}
+
+apt_install_series() {   # <series>
+  DEBIAN_FRONTEND=noninteractive apt-get -y install "proxmox-kernel-$1"
+}
+
+optin_risk_text() {   # <series>
+  cat <<EOF
+${1} is an OPT-IN kernel: newer than the default series ($(default_series)),
+and less tested. Proxmox offers opt-in kernels for newer hardware support and
+fixes, but they can have regressions, especially with passthrough, ZFS,
+network cards or graphics.
+
+Use it if you need something it adds, have console access to the host
+(to pick another kernel in the boot menu if it doesn't start), and are fine
+reporting or living with problems. The safe way is to try it for one boot.
+
+Install ${1} anyway?
+EOF
+}
+
+# The install flow. Returns 1 when the user goes Back from its first screen.
+flow_install() {
+  local step=series s label pkg abi size check nextk newer prompt run v
+  local -a items=() after=()
+  local -A preset=()
+  for v in KM_SERIES KM_OPTIN KM_AFTER KM_CONFIRM; do
+    if ui_is_set "$v"; then preset[$v]=1; fi
+  done
+  run=$(running_kernel)
+  while true; do
+    case $step in
+      series)
+        items=()
+        while read -r s; do
+          series_installed "$s" && continue
+          label=$(series_label "$s")
+          pkg=$(series_kernel_pkg "$s")
+          items+=("$s" "$(case $label in opt-in) printf 'OPT-IN, newer and less tested' ;; older) printf 'older, a fallback' ;; *) printf 'default' ;; esac)  ($(pkg_abi "$pkg"), $(human_bytes "$(pkg_download_size "$pkg")") download)")
+        done < <(repo_series)
+        if (( ${#items[@]} == 0 )); then
+          ui_msg "Every kernel series in your repositories is already installed."
+          return 1
+        fi
+        # shellcheck disable=SC2034  # read by lib/ui.func
+        UI_BACK_LABEL=Back
+        if ui_menu KM_SERIES "Which kernel series should be installed?" "${items[0]}" "${items[@]}"; then
+          repo_series | grep -qxF -- "$KM_SERIES" || die "There's no kernel series ${KM_SERIES} in your repositories."
+          series_installed "$KM_SERIES" && die "Kernel series ${KM_SERIES} is already installed."
+          step=optin
+        else
+          [[ -z "${preset[KM_SERIES]:-}" ]] || ui_cancelled
+          return 1
+        fi
+        ;;
+      optin)
+        if [[ "$(series_label "$KM_SERIES")" != opt-in ]]; then step=check; continue; fi
+        if ui_yesno KM_OPTIN "$(optin_risk_text "$KM_SERIES")" no "I understand" Back && [[ "$KM_OPTIN" == yes ]]; then
+          step=check
+        else
+          [[ -z "${preset[KM_OPTIN]:-}" ]] || die "Opt-in kernel ${KM_SERIES} needs KM_OPTIN=yes."
+          unset KM_OPTIN
+          [[ -n "${preset[KM_SERIES]:-}" ]] && ui_cancelled
+          unset KM_SERIES
+          step=series
+        fi
+        ;;
+      check)
+        pkg=$(series_kernel_pkg "$KM_SERIES")
+        abi=$(pkg_abi "$pkg")
+        size=$(pkg_download_size "$pkg")
+        [[ -n "$pkg" ]] || die "Cannot find the kernel package of series ${KM_SERIES}."
+        if (( RCP_TTY )); then clear; fi
+        say "   Downloading ${pkg} ($(human_bytes "$size")) to check its drivers before installing..."
+        if precheck_package "$pkg" "$abi"; then
+          check=$(hardware_check "$abi" || true)
+        else
+          check="could not be checked (download failed; see ${RCP_LOG})"
+        fi
+        log_line "Pre-install check of ${abi}: ${check}"
+        step=confirm
+        ;;
+      confirm)
+        nextk=$(next_boot_kernel)
+        newer=no
+        [[ "$(printf '%s\n%s\n' "$abi" "$nextk" | sort -V | tail -n 1)" == "$abi" && "$abi" != "$nextk" ]] && newer=yes
+        prompt="Install kernel ${KM_SERIES} (${abi})?
+
+  Series:       ${KM_SERIES}, $(series_label "$KM_SERIES")
+  Download:     $(human_bytes "$size"), about 1 GB installed
+  Your drivers: ${check}
+"
+        if [[ "$newer" == yes && -z "$(first_line "$PIN_FILE")" ]]; then
+          prompt+="
+It's newer than your current kernel (${nextk}), so after installing, the
+host would start it on the next reboot. You choose what to do next: try it
+for one boot only (recommended), boot it from now on, or not yet."
+        else
+          prompt+="
+Your next boot doesn't change: it stays on ${nextk}. After installing you
+can try ${abi} for one boot or pin it."
+        fi
+        prompt+="
+
+This script does not reboot."
+        if ui_yesno KM_CONFIRM "$prompt" yes Install Back && [[ "$KM_CONFIRM" == yes ]]; then
+          break
+        fi
+        [[ -z "${preset[KM_CONFIRM]:-}" ]] || ui_cancelled
+        unset KM_CONFIRM
+        [[ -n "${preset[KM_SERIES]:-}" ]] && ui_cancelled
+        unset KM_SERIES KM_OPTIN
+        step=series
+        ;;
+    esac
+  done
+
+  run_step "Installing proxmox-kernel-${KM_SERIES} (${abi})" apt_install_series "$KM_SERIES"
+  installed_kernels | awk '{ print $1 }' | grep -qxF -- "$abi" || die "Kernel ${abi} did not install (see ${RCP_LOG})."
+  log_line "Installed ${KM_SERIES} (${abi}); bootable: $(bootable_kernels | tr '\n' ' ')"
+  say_ok "Installed ${abi}; its drivers: $(hardware_check "$abi" || true)"
+
+  # What should the next boot do?
+  # shellcheck disable=SC2034  # read by lib/ui.func
+  UI_BACK_LABEL=Skip
+  if [[ "$(next_boot_kernel)" == "$abi" ]]; then
+    # Unattended: never let a newly installed kernel boot by surprise.
+    if [[ ! -t 0 || ! -t 1 ]] && ! ui_is_set KM_AFTER; then KM_AFTER=hold; fi
+    after=(try  "Try it on the next boot only, then return to ${run} (recommended)"
+           default "Boot it from now on (it's the newest kernel)"
+           hold "Not yet: keep booting ${run}")
+    ui_menu KM_AFTER "${abi} is now the newest kernel, so the next reboot would start it.
+
+What should the next boot do?" try "${after[@]}" || KM_AFTER=default
+    case $KM_AFTER in
+      try)
+        run_step "Pinning ${run} (the host returns to it after the trial)" do_pin "$run"
+        run_step "Setting ${abi} for the next boot only" do_try "$abi"
+        say "   ${run} is pinned so the host goes back to it after the trial. If ${abi} works"
+        say "   well, pin it (--pin ${abi}) or unpin (--unpin) to follow updates again."
+        ;;
+      hold) run_step "Pinning ${run}" do_pin "$run" ;;
+      *) ;;
+    esac
+  else
+    if [[ ! -t 0 || ! -t 1 ]] && ! ui_is_set KM_AFTER; then KM_AFTER=none; fi
+    after=(try  "Try it on the next boot only"
+           pin  "Pin it: boot it from now on"
+           none "Nothing for now (keep booting $(next_boot_kernel))")
+    ui_menu KM_AFTER "${abi} is installed. What should the next boot do?" none "${after[@]}" || KM_AFTER=none
+    case $KM_AFTER in
+      try) run_step "Setting ${abi} for the next boot only" do_try "$abi" ;;
+      pin) run_step "Pinning ${abi}" do_pin "$abi" ;;
+      *) ;;
+    esac
+  fi
+  log_line "After install (${KM_AFTER}): next boot $(next_boot_kernel), loader default $(loader_default_text)"
+  say_ok "Next boot: $(next_boot_kernel)   (boot loader default: $(loader_default_text))"
+  say "   Nothing has been rebooted."
+}
+
+# ---- removing old kernels ------------------------------------------------------------
+
+# Kernels that are safe to remove: not running, not next to boot, not pinned
+# (also not for the next boot), not the fallback -> "<abi> <package> <KiB>"
+removal_candidates() {
+  local run next pin nextpin fb abi pkg size
+  run=$(running_kernel)
+  next=$(next_boot_kernel)
+  pin=$(first_line "$PIN_FILE")
+  nextpin=$(first_line "$NEXT_PIN_FILE")
+  fb=$(bootable_kernels | grep -vxF -- "$next" | head -n 1)
+  while read -r abi pkg size; do
+    case $abi in "$run"|"$next"|"$pin"|"$nextpin"|"$fb") continue ;; esac
+    printf '%s %s %s\n' "$abi" "$pkg" "$size"
+  done < <(installed_kernels)
+  return 0
+}
+
+abi_series() { sed -E 's/^([0-9]+\.[0-9]+)\..*/\1/' <<<"$1"; }
+
+# Packages to purge for these kernels: their packages, the unsigned
+# companions, and a non-default series' meta package once none of its
+# kernels is left.
+removal_packages() {   # <abi>...
+  local abi pkg size ser left
+  local -a pkgs=() sel=("$@")
+  while read -r abi pkg size; do
+    printf '%s\n' "${sel[@]}" | grep -qxF -- "$abi" || continue
+    pkgs+=("$pkg")
+    if [[ "$pkg" == *-signed ]] && dpkg-query -W -f '${db:Status-Abbrev}' "${pkg%-signed}" 2>/dev/null | grep -q '^ii'; then
+      pkgs+=("${pkg%-signed}")
+    fi
+  done < <(installed_kernels)
+  for ser in $(printf '%s\n' "${sel[@]}" | while read -r a; do abi_series "$a"; done | sort -u); do
+    [[ "$ser" == "$(default_series)" ]] && continue
+    series_installed "$ser" || continue
+    left=$(installed_kernels | awk '{ print $1 }' | while read -r a; do
+      [[ "$(abi_series "$a")" == "$ser" ]] || continue
+      printf '%s\n' "${sel[@]}" | grep -qxF -- "$a" || printf '%s\n' "$a"
+    done)
+    [[ -n "$left" ]] || pkgs+=("proxmox-kernel-${ser}")
+  done
+  printf '%s\n' "${pkgs[@]}"
+}
+
+# apt must remove exactly these packages and nothing else.
+removal_is_exact() {   # <package>...
+  local want got
+  want=$(printf '%s\n' "$@" | sort -u)
+  got=$(apt-get -s purge "$@" 2>/dev/null | sed -n 's/^\(Purg\|Remv\) \([^ ]*\).*/\2/p' | sort -u)
+  if [[ "$want" == "$got" ]]; then return 0; fi
+  printf '%s\n' "$got" | grep -vxF -f <(printf '%s\n' "$want") | tr '\n' ' '
+  return 1
+}
+
+apt_purge() {
+  local p
+  DEBIAN_FRONTEND=noninteractive apt-get -y purge "$@"
+  # Also drop apt's cached download of each removed package.
+  for p in "$@"; do
+    rm -f -- /var/cache/apt/archives/"${p}"_*.deb
+  done
+}
+
+flow_remove() {
+  local abi pkg size total=0 extra v
+  local -a items=() sel=() pkgs=()
+  local -A preset=()
+  for v in KM_REMOVE KM_CONFIRM; do
+    if ui_is_set "$v"; then preset[$v]=1; fi
+  done
+  while true; do
+    items=()
+    while read -r abi pkg size; do
+      items+=("$abi" "$(human_kib "$size")$(bootable_kernels | grep -qxF -- "$abi" || printf ', not bootable')" on)
+    done < <(removal_candidates)
+    if (( ${#items[@]} == 0 )); then
+      ui_msg "There's nothing to remove: every installed kernel is running, next to boot, pinned or the fallback."
+      return 1
+    fi
+    # shellcheck disable=SC2034  # read by lib/ui.func
+    UI_BACK_LABEL=Back
+    if ! ui_checklist KM_REMOVE "Which old kernels should be removed?
+
+Only kernels that aren't running, next to boot, pinned or the fallback are
+listed. (Space ticks/unticks.)" "${items[@]}"; then
+      [[ -z "${preset[KM_REMOVE]:-}" ]] || ui_cancelled
+      return 1
+    fi
+    read -r -a sel <<<"$KM_REMOVE"
+    if (( ${#sel[@]} == 0 )); then
+      [[ -z "${preset[KM_REMOVE]:-}" ]] || { say_ok "Nothing selected; nothing removed."; return 0; }
+      unset KM_REMOVE
+      continue
+    fi
+    for abi in "${sel[@]}"; do
+      removal_candidates | awk '{ print $1 }' | grep -qxF -- "$abi" ||
+        die "${abi} can't be removed: it's not installed, or it's running, next to boot, pinned or the fallback."
+    done
+    mapfile -t pkgs < <(removal_packages "${sel[@]}")
+    if ! extra=$(removal_is_exact "${pkgs[@]}"); then
+      die "Removing these would also remove other packages (${extra}), so nothing was done."
+    fi
+    total=0
+    while read -r abi pkg size; do
+      printf '%s\n' "${sel[@]}" | grep -qxF -- "$abi" && total=$(( total + size ))
+    done < <(installed_kernels)
+    if ui_yesno KM_CONFIRM "Remove these kernels?
+
+  $(printf '%s ' "${sel[@]}")
+
+Packages: $(printf '%s ' "${pkgs[@]}")
+This frees about $(human_kib "$total"). apt was asked first (dry run): it
+removes these packages and nothing else.
+
+Your running, next-boot, pinned and fallback kernels stay." yes Remove Back && [[ "$KM_CONFIRM" == yes ]]; then
+      break
+    fi
+    [[ -z "${preset[KM_CONFIRM]:-}" ]] || ui_cancelled
+    unset KM_CONFIRM
+    [[ -n "${preset[KM_REMOVE]:-}" ]] && ui_cancelled
+    unset KM_REMOVE
+  done
+  run_step "Removing $(printf '%s ' "${sel[@]}")" apt_purge "${pkgs[@]}"
+  for abi in "${sel[@]}"; do
+    installed_kernels | awk '{ print $1 }' | grep -qxF -- "$abi" && die "${abi} is still installed (see ${RCP_LOG})."
+  done
+  log_line "Removed ${sel[*]} (${pkgs[*]}); bootable now: $(bootable_kernels | tr '\n' ' ')"
+  say_ok "Removed $(printf '%s ' "${sel[@]}")(freed about $(human_kib "$total"))"
+  say_ok "Next boot: $(next_boot_kernel)   (boot loader default: $(loader_default_text))"
+}
+
 # One change, with Back on every screen and Exit on the first.
 cmd_change() {
   local step=action prompt pin nextpin run newest
@@ -520,12 +869,22 @@ cmd_change() {
         fi
         [[ -n "$pin" ]] && acts+=(unpin "Remove the pin on ${pin} (boot the newest kernel again)")
         [[ -n "$nextpin" ]] && acts+=(cancel-try "Cancel the next-boot trial of ${nextpin}")
+        acts+=(install "Install another kernel series (older fallback, or opt-in)")
+        if [[ -n "$(removal_candidates)" ]]; then
+          acts+=(remove "Remove old kernels")
+        fi
         if ui_menu KM_ACTION "What would you like to do?" try "${acts[@]}"; then
           case $KM_ACTION in
+            install|remove)
+              if "flow_${KM_ACTION}"; then return 0; fi
+              [[ -n "${preset[KM_ACTION]:-}" ]] && ui_cancelled
+              unset KM_ACTION
+              continue
+              ;;
             try|pin) km_next kernel ;;
             keep) KM_KERNEL=$run; km_next confirm ;;
             unpin|cancel-try) km_next confirm ;;
-            *) die "KM_ACTION must be try, pin, keep, unpin or cancel-try." ;;
+            *) die "KM_ACTION must be try, pin, keep, unpin, cancel-try, install or remove." ;;
           esac
         else
           km_back
@@ -614,7 +973,8 @@ cmd_check() {   # <abi>
 usage() {
   cat <<'USAGE'
 Usage: kernel-manager.sh [--report | --check <version> | --try <version> |
-                         --pin <version> | --unpin | --cancel-try | --help]
+                         --pin <version> | --unpin | --cancel-try |
+                         --install <series> | --remove <version>... | --help]
 
 Show this Proxmox host's kernels: running, next to boot, pinned, installed
 (and whether they're bootable), the kernel series in your repositories,
@@ -628,6 +988,10 @@ try a kernel for one boot, pin or unpin one (it never reboots).
   --pin <version>     keep booting <version>
   --unpin             remove the pin and any trial
   --cancel-try        remove only the next-boot trial
+  --install <series>  install another kernel series (driver check first;
+                      opt-in series also need KM_OPTIN=yes)
+  --remove <version>... remove old kernels that aren't running, next to boot,
+                      pinned or the fallback
 USAGE
 }
 
@@ -647,6 +1011,13 @@ main() {
     --report) say_head "Proxmox kernel report"; report ;;
     --try|--pin) cmd_direct "${1#--}" "${2:-}" ;;
     --unpin|--cancel-try) cmd_direct "${1#--}" ;;
+    --install)
+      [[ -n "${2:-}" ]] || die "Usage: --install <series>, e.g. --install 6.17"
+      KM_SERIES=$2; : "${KM_CONFIRM:=yes}"; flow_install || true ;;
+    --remove)
+      shift
+      (( $# )) || die "Usage: --remove <version>... (see the cleanup suggestions in --report)"
+      KM_REMOVE="$*"; : "${KM_CONFIRM:=yes}"; flow_remove || true ;;
     "")
       say_head "Proxmox kernel report"
       report
