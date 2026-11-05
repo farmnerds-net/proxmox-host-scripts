@@ -37,6 +37,11 @@ Run it on the Proxmox host shell as root.
 
 When it's done, create a VM and choose the ISO under **OS > ISO image**.
 
+**Changed your mind?** Every screen has a **Back** button (or press Esc)
+that returns to the previous screen with your earlier choice still
+selected. The first screen has **Exit** instead. On the last screen the
+buttons are **Download** and **Back**.
+
 ## The list
 
 | Server | Desktop | Gaming |
