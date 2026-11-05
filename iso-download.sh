@@ -90,17 +90,72 @@ storage_free_kib() {   # <storage>
   iso_storages | awk -v s="$1" '$1 == s { print $2 }'
 }
 
-choose_storage() {
+# ---- the questions, as steps you can go back through ----------------------------
+#
+# Each step asks one question into one variable. Back returns to the
+# previous step with the earlier answer pre-selected; on the first screen
+# the button reads Exit and leaves. Steps whose variable was preset are
+# skipped both ways, so going back never lands on them.
+
+declare -gA WZ_PRESET=() WZ_LAST=()
+WZ_HIST=()
+WZ_STATE=""
+ISO_SIZE=0
+
+wz_var() {   # <step> -> the variable it asks for
+  case $1 in
+    storage) printf 'ISO_STORAGE' ;;
+    group) printf 'ISO_GROUP' ;;
+    list|results) printf 'ISO_DISTRO' ;;
+    search) printf 'ISO_QUERY' ;;
+    paste_url) printf 'ISO_URL' ;;
+    paste_sum) printf 'ISO_CHECKSUM' ;;
+    confirm) printf 'ISO_CONFIRM' ;;
+  esac
+}
+
+wz_init() {
+  local v
+  for v in ISO_STORAGE ISO_GROUP ISO_DISTRO ISO_QUERY ISO_URL ISO_CHECKSUM ISO_CONFIRM; do
+    if ui_is_set "$v"; then WZ_PRESET[$v]=1; fi
+  done
+  return 0
+}
+
+wz_clear() {   # <var>: forget an answer, unless it was preset
+  if [[ -z "${WZ_PRESET[$1]:-}" ]]; then unset "$1"; fi
+}
+
+wz_go() {   # <next step>: remember this step (unless preset) and move on
+  local v
+  v=$(wz_var "$WZ_STATE")
+  if [[ -n "$v" && -z "${WZ_PRESET[$v]:-}" ]]; then WZ_HIST+=("$WZ_STATE"); fi
+  WZ_STATE=$1
+}
+
+wz_back() {   # go back one question, or leave from the first one
+  local v
+  v=$(wz_var "$WZ_STATE")
+  if [[ -n "$v" ]]; then wz_clear "$v"; fi
+  if (( ${#WZ_HIST[@]} == 0 )); then ui_cancelled; fi
+  WZ_STATE=${WZ_HIST[-1]}
+  unset 'WZ_HIST[-1]'
+  v=$(wz_var "$WZ_STATE")
+  WZ_LAST[$v]=${!v:-}
+  wz_clear "$v"
+}
+
+step_storage() {
   local last list name free type def
   local -a items=()
   list=$(iso_storages)
   [[ -n "$list" ]] || die "No active storage on this host can hold ISO images. Enable 'ISO image' content on a storage (Datacenter > Storage) first."
   last=$(conf_last_storage)
-  def=""
+  def=${WZ_LAST[ISO_STORAGE]:-}
   while read -r name free type; do
     if [[ "$name" == "$last" ]]; then
       items+=("$name" "$(human_bytes $(( free * 1024 ))) free, ${type}  (last used)")
-      def=$name
+      [[ -n "$def" ]] || def=$name
     else
       items+=("$name" "$(human_bytes $(( free * 1024 ))) free, ${type}")
     fi
@@ -108,12 +163,10 @@ choose_storage() {
   [[ -n "$def" ]] || def=${items[0]}
   ui_menu ISO_STORAGE "Where should the ISO be saved?
 
-These storages can hold ISO images." "$def" "${items[@]}"
+These storages can hold ISO images." "$def" "${items[@]}" || return 1
   grep -qx -- "$ISO_STORAGE" < <(awk '{ print $1 }' <<<"$list") ||
     die "Storage '${ISO_STORAGE}' is not an active storage that can hold ISO images."
 }
-
-# ---- choosing a distribution ---------------------------------------------------
 
 distro_items() {   # <slug>... -> menu items "slug" "name"
   local s
@@ -126,64 +179,12 @@ distro_items() {   # <slug>... -> menu items "slug" "name"
   done
 }
 
-choose_from() {   # <prompt> <slug>...
-  local prompt=$1
-  local -a items=()
-  shift
-  mapfile -t items < <(distro_items "$@")
-  ui_menu ISO_DISTRO "$prompt" "$1" "${items[@]}"
-}
-
 valid_search() { [[ "$1" =~ [A-Za-z0-9] ]]; }
-
-choose_distro() {
-  local group q
-  local -a found=() items=()
-  if ui_is_set ISO_DISTRO; then return 0; fi
-  ui_menu group "What would you like to download?" server \
-    server  "Server distributions" \
-    desktop "Desktop distributions" \
-    gaming  "Gaming distributions" \
-    search  "Find your own (search by name)" \
-    url     "Paste a download link and checksum"
-  case "$group" in
-    server|desktop|gaming)
-      mapfile -t found < <(iso_slugs "$group")
-      choose_from "Which ${group} distribution?" "${found[@]}"
-      ;;
-    search)
-      ui_input q "Search for a distribution by name (for example: mint, fedora, bazzite)." "" \
-        valid_search "Type at least one letter or digit."
-      mapfile -t found < <(iso_search "$q")
-      if (( ${#found[@]} == 0 )); then
-        ui_msg "Nothing in the list matches '${q}'.
-
-You can still download it: find the ISO on that distribution's official website, copy the download link and its SHA-256 (or SHA-512) checksum from the same page, and paste them in the next step."
-        ISO_DISTRO=url
-      else
-        mapfile -t items < <(distro_items "${found[@]}")
-        ui_menu ISO_DISTRO "Matches for '${q}':" "${found[0]}" "${items[@]}" url "Not listed: paste a download link"
-      fi
-      ;;
-    url) ISO_DISTRO=url ;;
-  esac
-}
-
 valid_iso_url() { [[ "$1" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/[^[:space:]]*\.iso([?#][^[:space:]]*)?$ ]]; }
 valid_checksum() { [[ "${1,,}" =~ ^([0-9a-f]{64}|[0-9a-f]{128})$ ]]; }
 
-# Fill RES_* from a link and checksum the user pasted.
-resolve_pasted() {   # [<official pages to mention>]
-  local note=""
-  [[ -n "${1:-}" ]] && note="
-
-Get both from the official site: $1"
-  ui_input ISO_URL "Download link of the ISO (https://..., ending in .iso).${note}" "" valid_iso_url \
-    "Enter an https:// link that ends in .iso."
-  ui_input ISO_CHECKSUM "Its SHA-256 or SHA-512 checksum, from the same official page.
-
-The download is checked against it and discarded if it doesn't match." "" valid_checksum \
-    "Paste the 64-character (SHA-256) or 128-character (SHA-512) checksum."
+# Fill RES_* from the link and checksum the user pasted.
+use_pasted() {
   RES_URL=$ISO_URL
   RES_FILE=${ISO_URL%%[?#]*}
   RES_FILE=${RES_FILE##*/}
@@ -191,25 +192,164 @@ The download is checked against it and discarded if it doesn't match." "" valid_
   RES_SUM=${ISO_CHECKSUM,,}
   if (( ${#RES_SUM} == 64 )); then RES_ALGO=sha256; else RES_ALGO=sha512; fi
   RES_VERSION="(from your link)"
-  ISO_NAME=$RES_FILE
+  if [[ "$ISO_DISTRO" == url ]]; then ISO_NAME=$RES_FILE; fi
 }
 
-resolve_choice() {
+# Not a question: decide what comes after a distribution was picked.
+step_pick() {
   if [[ "$ISO_DISTRO" == url ]]; then
-    resolve_pasted
+    ISO_NAME=""
+    WZ_STATE=paste_url
     return 0
   fi
   iso_entry "$ISO_DISTRO" >/dev/null || die "Unknown distribution '${ISO_DISTRO}' (see --list)."
   ISO_NAME=$(iso_field "$ISO_DISTRO" 3)
   if [[ "$(iso_field "$ISO_DISTRO" 4)" == manual ]]; then
-    resolve_pasted "${ISO_MANUAL_PAGES[$ISO_DISTRO]}"
-    ISO_NAME="$(iso_field "$ISO_DISTRO" 3)"
+    WZ_STATE=paste_url
     return 0
   fi
   say "   Looking up the current ${ISO_NAME} release..."
-  iso_resolve "$ISO_DISTRO" 2>>"$RCP_LOG" ||
-    die "Could not find the current ${ISO_NAME} ISO on its official site (details in ${RCP_LOG}). Its site may have changed; please report it."
-  log_line "Resolved ${ISO_DISTRO}: ${RES_VERSION} ${RES_URL} ${RES_ALGO}:${RES_SUM}"
+  if iso_resolve "$ISO_DISTRO" 2>>"$RCP_LOG"; then
+    log_line "Resolved ${ISO_DISTRO}: ${RES_VERSION} ${RES_URL} ${RES_ALGO}:${RES_SUM}"
+    WZ_STATE=confirm
+    return 0
+  fi
+  local why="Could not find the current ${ISO_NAME} ISO on its official site (details in ${RCP_LOG}). Its site may have changed; please report it."
+  [[ -z "${WZ_PRESET[ISO_DISTRO]:-}" ]] || die "$why"
+  ui_msg "$why"
+  WZ_STATE=pick   # wz_back goes back to the list it was picked from
+  wz_back
+}
+
+# Ask everything; returns once the user has confirmed a download.
+# Returns 1 if the ISO is already there (nothing to do).
+wizard() {
+  local -a found=() items=()
+  local note free_kib
+  wz_init
+  WZ_STATE=storage
+  while true; do
+    # shellcheck disable=SC2034  # read by lib/ui.func
+    if (( ${#WZ_HIST[@]} )); then UI_BACK_LABEL=Back; else UI_BACK_LABEL=Exit; fi
+    case $WZ_STATE in
+      storage)
+        if step_storage; then wz_go group; else wz_back; fi
+        ;;
+      group)
+        if [[ -n "${WZ_PRESET[ISO_DISTRO]:-}" ]]; then WZ_STATE=pick; continue; fi
+        wz_clear ISO_DISTRO
+        if ui_menu ISO_GROUP "What would you like to download?" "${WZ_LAST[ISO_GROUP]:-server}" \
+          server  "Server distributions" \
+          desktop "Desktop distributions" \
+          gaming  "Gaming distributions" \
+          search  "Find your own (search by name)" \
+          url     "Paste a download link and checksum"; then
+          case $ISO_GROUP in
+            server|desktop|gaming) wz_go list ;;
+            search) wz_go search ;;
+            *) ISO_DISTRO=url; wz_go pick ;;
+          esac
+        else
+          wz_back
+        fi
+        ;;
+      list)
+        mapfile -t found < <(iso_slugs "$ISO_GROUP")
+        mapfile -t items < <(distro_items "${found[@]}")
+        if ui_menu ISO_DISTRO "Which ${ISO_GROUP} distribution?" "${WZ_LAST[ISO_DISTRO]:-${found[0]}}" "${items[@]}"; then
+          wz_go pick
+        else
+          wz_back
+        fi
+        ;;
+      search)
+        wz_clear ISO_DISTRO
+        if ui_input ISO_QUERY "Search for a distribution by name (for example: mint, fedora, bazzite)." \
+          "${WZ_LAST[ISO_QUERY]:-}" valid_search "Type at least one letter or digit."; then
+          wz_go results
+        else
+          wz_back
+        fi
+        ;;
+      results)
+        mapfile -t found < <(iso_search "$ISO_QUERY")
+        if (( ${#found[@]} == 0 )); then
+          ui_msg "Nothing in the list matches '${ISO_QUERY}'.
+
+You can still download it: find the ISO on that distribution's official website, copy the download link and its SHA-256 (or SHA-512) checksum from the same page, and paste them in the next step. (Back there returns to the search.)"
+          ISO_DISTRO=url
+          WZ_STATE=pick   # not remembered: Back from the link goes to the search
+          continue
+        fi
+        mapfile -t items < <(distro_items "${found[@]}")
+        if ui_menu ISO_DISTRO "Matches for '${ISO_QUERY}':" "${WZ_LAST[ISO_DISTRO]:-${found[0]}}" \
+          "${items[@]}" url "Not listed: paste a download link"; then
+          wz_go pick
+        else
+          wz_back
+        fi
+        ;;
+      pick)
+        step_pick
+        ;;
+      paste_url)
+        note=""
+        if [[ "$ISO_DISTRO" != url ]]; then
+          note="
+
+Get both from the official site: ${ISO_MANUAL_PAGES[$ISO_DISTRO]}"
+        fi
+        if ui_input ISO_URL "Download link of the ISO (https://..., ending in .iso).${note}" \
+          "${WZ_LAST[ISO_URL]:-}" valid_iso_url "Enter an https:// link that ends in .iso."; then
+          wz_go paste_sum
+        else
+          wz_back
+        fi
+        ;;
+      paste_sum)
+        if ui_input ISO_CHECKSUM "Its SHA-256 or SHA-512 checksum, from the same official page.
+
+The download is checked against it and discarded if it doesn't match." "${WZ_LAST[ISO_CHECKSUM]:-}" \
+          valid_checksum "Paste the 64-character (SHA-256) or 128-character (SHA-512) checksum."; then
+          use_pasted
+          wz_go confirm
+        else
+          wz_back
+        fi
+        ;;
+      confirm)
+        if already_there "$ISO_STORAGE" "$RES_FILE"; then
+          say_ok "${RES_FILE} is already on ${ISO_STORAGE}; nothing to download."
+          conf_save_storage "$ISO_STORAGE"
+          return 1
+        fi
+        ISO_SIZE=$(remote_size "$RES_URL")
+        free_kib=$(storage_free_kib "$ISO_STORAGE")
+        if (( ISO_SIZE > 0 && ISO_SIZE / 1024 > free_kib )); then
+          note="Not enough space on ${ISO_STORAGE}: the ISO is $(human_bytes "$ISO_SIZE"), $(human_bytes $(( free_kib * 1024 ))) is free."
+          if [[ -n "${WZ_PRESET[ISO_CONFIRM]:-}" ]]; then die "$note"; fi
+          ui_msg "${note}
+
+Pick another storage or a smaller ISO."
+          wz_back
+          continue
+        fi
+        if ui_yesno ISO_CONFIRM "Download this ISO?
+
+  Distribution: ${ISO_NAME}
+  Version:      ${RES_VERSION}
+  File:         ${RES_FILE}
+  Size:         $( (( ISO_SIZE > 0 )) && human_bytes "$ISO_SIZE" || printf 'unknown')
+  From:         $(sed -E 's#^https://([^/]+)/.*#\1#' <<<"$RES_URL")
+  Checksum:     ${RES_ALGO^^} (verified after download)
+  Save to:      ${ISO_STORAGE}" yes Download Back && [[ "$ISO_CONFIRM" == yes ]]; then
+          return 0
+        fi
+        [[ -z "${WZ_PRESET[ISO_CONFIRM]:-}" ]] || ui_cancelled   # preset "no": just stop
+        wz_back
+        ;;
+    esac
+  done
 }
 
 # ---- download ------------------------------------------------------------------
@@ -305,34 +445,10 @@ cmd_check() {
 }
 
 cmd_download() {
-  local size free_kib label
   preflight_checks
-  choose_storage
-  choose_distro
-  resolve_choice
-  label=$ISO_NAME
-  if already_there "$ISO_STORAGE" "$RES_FILE"; then
-    say_ok "${RES_FILE} is already on ${ISO_STORAGE}; nothing to download."
-    conf_save_storage "$ISO_STORAGE"
-    return 0
-  fi
-  size=$(remote_size "$RES_URL")
-  free_kib=$(storage_free_kib "$ISO_STORAGE")
-  if (( size > 0 && size / 1024 > free_kib )); then
-    die "Not enough space on ${ISO_STORAGE}: the ISO is $(human_bytes "$size"), $(human_bytes $(( free_kib * 1024 ))) is free."
-  fi
-  ui_yesno ISO_CONFIRM "Download this ISO?
-
-  Distribution: ${ISO_NAME}
-  Version:      ${RES_VERSION}
-  File:         ${RES_FILE}
-  Size:         $( (( size > 0 )) && human_bytes "$size" || printf 'unknown')
-  From:         $(sed -E 's#^https://([^/]+)/.*#\1#' <<<"$RES_URL")
-  Checksum:     ${RES_ALGO^^} (verified after download)
-  Save to:      ${ISO_STORAGE}" yes
-  [[ "$ISO_CONFIRM" == yes ]] || ui_cancelled
+  wizard || return 0
   log_line "Settings: storage=${ISO_STORAGE} distro=${ISO_DISTRO} file=${RES_FILE}"
-  download "$ISO_STORAGE" "$RES_URL" "$RES_FILE" "$RES_ALGO" "$RES_SUM" "$size" "$label"
+  download "$ISO_STORAGE" "$RES_URL" "$RES_FILE" "$RES_ALGO" "$RES_SUM" "$ISO_SIZE" "$ISO_NAME"
   conf_save_storage "$ISO_STORAGE"
   say_ok "${RES_FILE} downloaded to ${ISO_STORAGE} and its ${RES_ALGO^^} checksum verified"
   say "   Use it when creating a VM: OS > ISO image > ${ISO_STORAGE}:iso/${RES_FILE}"

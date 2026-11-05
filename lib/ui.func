@@ -7,10 +7,17 @@
 # script can be run without questions by presetting them. Only these
 # functions read input.
 #
-# A script sets UI_TITLE, and may set UI_CANCEL_MSG (what Cancel prints).
+# Each question returns 0 when answered and 1 when the user pressed the
+# cancel button or Esc. They never exit: the script decides what that
+# means (usually: go back one question). The cancel button reads
+# UI_BACK_LABEL ("Back" by default; "Exit" on a first screen).
+#
+# A script sets UI_TITLE, and may set UI_CANCEL_MSG (printed by
+# ui_cancelled when the user leaves).
 
 UI_TITLE=${UI_TITLE:-proxmox-host-scripts}
 UI_CANCEL_MSG=${UI_CANCEL_MSG:-Cancelled. Nothing was changed.}
+UI_BACK_LABEL=${UI_BACK_LABEL:-Back}
 
 ui_is_set() { [[ -n "${!1+x}" ]]; }
 
@@ -21,7 +28,7 @@ ui_need_tty() {   # <variable that needs an answer>
   command -v whiptail >/dev/null 2>&1 || die "whiptail is not installed."
 }
 
-ui_cancelled() {
+ui_cancelled() {   # the user left: say so and stop
   if (( RCP_TTY )); then clear; fi
   say_warn "$UI_CANCEL_MSG"
   exit 0
@@ -39,8 +46,8 @@ ui_menu() {   # <var> <prompt> <default tag> <tag> <description> [...]
   ui_need_tty "$var"
   rows=$(( $# / 2 ))
   (( rows > 14 )) && rows=14
-  value=$(whiptail --title "$UI_TITLE" --default-item "$def" \
-    --menu "$prompt" $(( rows + 9 )) 78 "$rows" "$@" 3>&1 1>&2 2>&3) || ui_cancelled
+  value=$(whiptail --title "$UI_TITLE" --cancel-button "$UI_BACK_LABEL" --default-item "$def" \
+    --menu "$prompt" $(( rows + 9 )) 78 "$rows" "$@" 3>&1 1>&2 2>&3) || return 1
   printf -v "$var" '%s' "$value"
 }
 
@@ -49,7 +56,8 @@ ui_input() {   # <var> <prompt> <default> <validator> <error text>
   if ui_is_set "$var"; then return 0; fi
   ui_need_tty "$var"
   while true; do
-    value=$(whiptail --title "$UI_TITLE" --inputbox "$prompt" 14 78 "$value" 3>&1 1>&2 2>&3) || ui_cancelled
+    value=$(whiptail --title "$UI_TITLE" --cancel-button "$UI_BACK_LABEL" \
+      --inputbox "$prompt" 14 78 "$value" 3>&1 1>&2 2>&3) || return 1
     if "$check" "$value"; then
       printf -v "$var" '%s' "$value"
       return 0
@@ -58,16 +66,18 @@ ui_input() {   # <var> <prompt> <default> <validator> <error text>
   done
 }
 
-ui_yesno() {   # <var> <prompt> <default yes|no>
+# Sets <var> to yes or no. Esc returns 1 without setting it.
+ui_yesno() {   # <var> <prompt> <default yes|no> [<yes label> <no label>]
   local var=$1 rc=0
   local -a extra=()
   if ui_is_set "$var"; then return 0; fi
   ui_need_tty "$var"
-  [[ "$3" == no ]] && extra=(--defaultno)
+  [[ "$3" == no ]] && extra+=(--defaultno)
+  [[ -n "${4:-}" ]] && extra+=(--yes-button "$4" --no-button "${5:-No}")
   whiptail --title "$UI_TITLE" "${extra[@]}" --yesno "$2" 20 78 || rc=$?
   case $rc in
     0) printf -v "$var" 'yes' ;;
     1) printf -v "$var" 'no' ;;
-    *) ui_cancelled ;;
+    *) return 1 ;;
   esac
 }
