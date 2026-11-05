@@ -1,0 +1,80 @@
+# shellcheck shell=bash
+#
+# lib/progress.func - a one-line progress meter for long transfers.
+#
+#   progress_draw <label> <done bytes> <total bytes> <bytes/s>
+#   progress_done
+#
+# On a terminal it redraws one line in place, e.g.
+#   ⬇ Fedora Workstation ▕██████████▋         ▏ 52%  1.1/2.1 GB  86 MB/s  0:12 left
+# Elsewhere (logs, cron) it prints a plain line every 10%.
+
+PROGRESS_WIDTH=22
+PROGRESS_LAST_STEP=-1
+PROGRESS_PARTS=(" " "▏" "▎" "▍" "▌" "▋" "▊" "▉")
+
+human_bytes() {   # <bytes> -> "1.1 GB"
+  awk -v b="$1" 'BEGIN {
+    split("B KB MB GB TB", u, " "); i = 1
+    while (b >= 1000 && i < 5) { b /= 1000; i++ }
+    printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i] }'
+}
+
+human_time() {   # <seconds> -> "1:05" / "1:02:05"
+  local s=$1
+  if (( s >= 3600 )); then
+    printf '%d:%02d:%02d' $(( s / 3600 )) $(( s % 3600 / 60 )) $(( s % 60 ))
+  else
+    printf '%d:%02d' $(( s / 60 )) $(( s % 60 ))
+  fi
+}
+
+progress_bar() {   # <done> <total> -> the bar, PROGRESS_WIDTH cells wide
+  local done=$1 total=$2 eighths full part bar="" i
+  (( total > 0 )) || total=1
+  (( done > total )) && done=$total
+  eighths=$(( done * PROGRESS_WIDTH * 8 / total ))
+  full=$(( eighths / 8 ))
+  part=$(( eighths % 8 ))
+  for (( i = 0; i < full; i++ )); do bar+="█"; done
+  if (( full < PROGRESS_WIDTH )); then
+    bar+="${PROGRESS_PARTS[part]}"
+    for (( i = full + 1; i < PROGRESS_WIDTH; i++ )); do bar+=" "; done
+  fi
+  printf '%s' "$bar"
+}
+
+progress_draw() {   # <label> <done> <total> <bytes per second>
+  local label=$1 done=$2 total=$3 rate=$4 pct eta="" line
+  (( total > 0 )) && pct=$(( done * 100 / total )) || pct=0
+  (( pct > 100 )) && pct=100
+  if (( rate > 0 && total > done )); then
+    eta="  $(human_time $(( (total - done) / rate ))) left"
+  fi
+  if (( RCP_TTY )); then
+    line=$(printf ' %s⬇%s %s %s▕%s▏%s %3d%%  %s/%s  %s/s%s' \
+      "$C_BLUE" "$C_RESET" "$label" "$C_GREEN" "$(progress_bar "$done" "$total")" "$C_RESET" \
+      "$pct" "$(human_bytes "$done")" "$(human_bytes "$total")" "$(human_bytes "$rate")" "$eta")
+    printf '\r\e[K%s' "$line"
+  elif (( pct / 10 != PROGRESS_LAST_STEP )); then
+    PROGRESS_LAST_STEP=$(( pct / 10 ))
+    say "   ${label}: ${pct}% ($(human_bytes "$done") of $(human_bytes "$total"))"
+  fi
+}
+
+PROGRESS_LAST_STATUS=""
+
+progress_status() {   # <text>: replace the meter line with a status (e.g. verifying)
+  if (( RCP_TTY )); then
+    printf '\r\e[K %s%s%s %s' "$C_BLUE" "⏳" "$C_RESET" "$1"
+  elif [[ "$1" != "$PROGRESS_LAST_STATUS" ]]; then
+    say "   $1"
+  fi
+  PROGRESS_LAST_STATUS=$1
+}
+
+progress_done() {
+  if (( RCP_TTY )); then printf '\r\e[K'; fi
+  PROGRESS_LAST_STEP=-1
+  PROGRESS_LAST_STATUS=""
+}
