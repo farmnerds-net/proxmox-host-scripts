@@ -11,6 +11,7 @@ behave the same.
 | Script | What it does |
 | --- | --- |
 | [iso-download](docs/iso-download.md) | Download a Linux ISO (server, desktop or gaming) to a storage, from the official site, checksum-verified, with a progress meter |
+| [cpu-governor](docs/cpu-governor.md) | Detect the CPU and how it scales, pick a Performance / Balanced / Power saver profile that survives reboots, undo it; checks microcode |
 
 ## Usage
 
