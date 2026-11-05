@@ -1,0 +1,377 @@
+# shellcheck shell=bash
+#
+# iso/catalog.func - the distributions iso-download.sh offers, and how to
+# find each one's current ISO and checksum on its official site.
+#
+# Each catalog entry is "slug|category|name|kind":
+#   category  server | desktop | gaming
+#   kind      auto   -> iso_resolve_<slug with - as _> finds the current ISO
+#             manual -> no reliable automatic source; the user is shown
+#                       ISO_MANUAL_PAGES[slug] and pastes a URL and checksum
+#
+# A resolver sets RES_URL, RES_FILE (the name to save it as), RES_SUM,
+# RES_ALGO (sha256 or sha512) and RES_VERSION, and returns 0. On failure
+# it prints why on stderr and returns 1. Resolvers only read the
+# distribution's own release files (or an official mirror listed by the
+# distribution); they never download the ISO.
+#
+# amd64 (x86_64) only for now.
+
+ISO_CATALOG=(
+  "debian|server|Debian (netinst)|auto"
+  "ubuntu-server|server|Ubuntu Server LTS|auto"
+  "rocky|server|Rocky Linux (minimal)|auto"
+  "almalinux|server|AlmaLinux (minimal)|auto"
+  "fedora-server|server|Fedora Server (DVD)|auto"
+  "opensuse-leap|server|openSUSE Leap (offline installer)|auto"
+  "alpine|server|Alpine Linux (virt)|auto"
+  "proxmox-ve|server|Proxmox VE|auto"
+  "proxmox-backup|server|Proxmox Backup Server|auto"
+
+  "ubuntu-desktop|desktop|Ubuntu Desktop LTS|auto"
+  "linuxmint|desktop|Linux Mint (Cinnamon)|auto"
+  "fedora-workstation|desktop|Fedora Workstation|auto"
+  "popos|desktop|Pop!_OS (Intel/AMD)|auto"
+  "popos-nvidia|desktop|Pop!_OS (NVIDIA)|auto"
+  "manjaro|desktop|Manjaro (KDE Plasma)|auto"
+  "mxlinux|desktop|MX Linux (Xfce)|auto"
+  "endeavouros|desktop|EndeavourOS|auto"
+  "opensuse-tumbleweed|desktop|openSUSE Tumbleweed (DVD)|auto"
+  "archlinux|desktop|Arch Linux|auto"
+  "nixos|desktop|NixOS (graphical)|auto"
+  "kali|desktop|Kali Linux (installer)|auto"
+  "zorin|desktop|Zorin OS|manual"
+  "elementary|desktop|elementary OS|manual"
+
+  "cachyos|gaming|CachyOS (desktop)|auto"
+  "cachyos-handheld|gaming|CachyOS (handheld)|auto"
+  "bazzite|gaming|Bazzite (AMD/Intel GPU)|auto"
+  "bazzite-nvidia|gaming|Bazzite (NVIDIA, open driver)|auto"
+  "bazzite-deck|gaming|Bazzite Deck (Steam Gaming Mode)|auto"
+  "nobara|gaming|Nobara (KDE)|auto"
+  "garuda-gaming|gaming|Garuda dr460nized Gaming|auto"
+)
+
+# Official download page and checksum page for the manual entries.
+# shellcheck disable=SC2034  # read by iso-download.sh
+declare -gA ISO_MANUAL_PAGES=(
+  [zorin]="https://zorin.com/os/download/ (checksums: https://help.zorin.com/docs/getting-started/check-the-integrity-of-your-copy-of-zorin-os/)"
+  [elementary]="https://elementary.io/ (the checksum is shown with the download)"
+)
+
+# ---- catalog lookups ----------------------------------------------------------
+
+iso_entry() {   # <slug> -> its catalog line
+  local e
+  for e in "${ISO_CATALOG[@]}"; do
+    [[ "${e%%|*}" == "$1" ]] && { printf '%s\n' "$e"; return 0; }
+  done
+  return 1
+}
+
+iso_field() {   # <slug> <1-4>
+  local e
+  e=$(iso_entry "$1") || return 1
+  cut -d'|' -f"$2" <<<"$e"
+}
+
+iso_slugs() {   # [category] -> slugs, in catalog order
+  local e
+  for e in "${ISO_CATALOG[@]}"; do
+    if [[ -z "${1:-}" || "$(cut -d'|' -f2 <<<"$e")" == "$1" ]]; then
+      printf '%s\n' "${e%%|*}"
+    fi
+  done
+  return 0
+}
+
+iso_search() {   # <text> -> slugs whose name or slug contains it (any case)
+  local e q=${1,,}
+  for e in "${ISO_CATALOG[@]}"; do
+    if [[ "${e,,}" == *"$q"* ]]; then
+      printf '%s\n' "${e%%|*}"
+    fi
+  done
+  return 0
+}
+
+iso_resolve() {   # <slug>: run its resolver
+  local fn="iso_resolve_${1//-/_}"
+  RES_URL="" RES_FILE="" RES_SUM="" RES_ALGO="" RES_VERSION=""
+  declare -F "$fn" >/dev/null || { printf 'no resolver for %s\n' "$1" >&2; return 1; }
+  "$fn" || return 1
+  [[ "$RES_URL" == https://* ]] || { printf '%s: not an https URL: %s\n' "$1" "$RES_URL" >&2; return 1; }
+  [[ "$RES_FILE" =~ ^[A-Za-z0-9._+-]+\.iso$ ]] || { printf '%s: bad file name: %s\n' "$1" "$RES_FILE" >&2; return 1; }
+  case "$RES_ALGO" in
+    sha256) [[ "$RES_SUM" =~ ^[0-9a-f]{64}$ ]] ;;
+    sha512) [[ "$RES_SUM" =~ ^[0-9a-f]{128}$ ]] ;;
+    *) false ;;
+  esac || { printf '%s: no valid %s checksum found\n' "$1" "${RES_ALGO:-?}" >&2; return 1; }
+}
+
+# ---- helpers for resolvers ----------------------------------------------------
+
+iso_fetch() {   # <url> -> body
+  curl -fsSL --retry 2 --max-time 30 "$1"
+}
+
+# "hash  file" / "hash *file" lists (GNU sha256sum style): newest file
+# whose name matches the regex -> "hash file"
+iso_pick_gnu() {   # <list text> <file regex>
+  awk -v re="$2" 'NF >= 2 { f = $2; sub(/^\*/, "", f); if (f ~ re) print $1, f }' <<<"$1" |
+    sort -k2,2V | tail -n 1
+}
+
+# "SHA256 (file) = hash" lists (BSD style) -> "hash file"
+iso_pick_bsd() {   # <list text> <file regex>
+  sed -n 's/^SHA256 (\(.*\)) = \([0-9a-f]\{64\}\)$/\2 \1/p' <<<"$1" |
+    awk -v re="$2" '$2 ~ re' | sort -k2,2V | tail -n 1
+}
+
+# shellcheck disable=SC2034  # RES_* are read by iso-download.sh
+iso_set() {   # <url> <file> <sum> <algo> <version>
+  RES_URL=$1 RES_FILE=$2 RES_SUM=$3 RES_ALGO=$4 RES_VERSION=$5
+}
+
+iso_from_list() {   # <base url> <list file name> <bsd|gnu> <file regex> <version sed>
+  local base=$1 list hash file
+  list=$(iso_fetch "${base}$2") || return 1
+  if [[ "$3" == bsd ]]; then
+    read -r hash file < <(iso_pick_bsd "$list" "$4")
+  else
+    read -r hash file < <(iso_pick_gnu "$list" "$4")
+  fi
+  [[ -n "${file:-}" ]] || { printf 'no file matching %s in %s%s\n' "$4" "$base" "$2" >&2; return 1; }
+  iso_set "${base}${file}" "$file" "$hash" sha256 "$(sed -n "$5" <<<"$file")"
+}
+
+# ---- server -------------------------------------------------------------------
+
+iso_resolve_debian() {
+  iso_from_list "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/" SHA256SUMS gnu \
+    '^debian-[0-9.]+-amd64-netinst\.iso$' 's/^debian-\([0-9.]*\)-.*/\1/p'
+}
+
+# Newest supported LTS from Ubuntu's own release list, e.g. "26.04.1".
+ubuntu_lts_version() {
+  iso_fetch https://changelogs.ubuntu.com/meta-release-lts |
+    awk '/^Version:/ { v = $2 } /^Supported: 1/ { s = v } END { print s }'
+}
+
+ubuntu_resolve() {   # <kind: live-server | desktop>
+  local v
+  v=$(ubuntu_lts_version) || return 1
+  [[ "$v" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { printf 'cannot read the Ubuntu LTS version\n' >&2; return 1; }
+  iso_from_list "https://releases.ubuntu.com/${v}/" SHA256SUMS gnu \
+    "^ubuntu-${v//./\\.}-$1-amd64\\.iso\$" 's/^ubuntu-\([0-9.]*\)-.*/\1/p'
+}
+
+iso_resolve_ubuntu_server() { ubuntu_resolve live-server; }
+
+# Rocky and AlmaLinux: the newest major release that has an x86_64 ISO dir.
+el_major() {   # <dir listing url>
+  iso_fetch "$1" | grep -oE 'href="[0-9]+/"' | grep -oE '[0-9]+' | sort -n | tail -n 1
+}
+
+iso_resolve_rocky() {
+  local m
+  m=$(el_major https://download.rockylinux.org/pub/rocky/) || return 1
+  iso_from_list "https://download.rockylinux.org/pub/rocky/${m}/isos/x86_64/" CHECKSUM bsd \
+    '^Rocky-[0-9.]+-x86_64-minimal\.iso$' 's/^Rocky-\([0-9.]*\)-.*/\1/p'
+}
+
+iso_resolve_almalinux() {
+  local m
+  m=$(el_major https://repo.almalinux.org/almalinux/) || return 1
+  iso_from_list "https://repo.almalinux.org/almalinux/${m}/isos/x86_64/" CHECKSUM bsd \
+    '^AlmaLinux-[0-9.]+-x86_64-minimal\.iso$' 's/^AlmaLinux-\([0-9.]*\)-.*/\1/p'
+}
+
+# Fedora publishes every image, with its checksum, in releases.json.
+fedora_resolve() {   # <variant> <link regex>
+  local line
+  line=$(iso_fetch https://fedoraproject.org/releases.json | VARIANT=$1 RE=$2 perl -MJSON::PP -e '
+    my $d = decode_json(join "", <STDIN>);
+    my @m = grep { $_->{arch} eq "x86_64" && $_->{variant} eq $ENV{VARIANT}
+                   && $_->{version} =~ /^\d+$/ && $_->{link} =~ /$ENV{RE}/ } @$d;
+    my ($b) = sort { $b->{version} <=> $a->{version} } @m;
+    print "$b->{version} $b->{sha256} $b->{link}\n" if $b;') || return 1
+  local ver sum link
+  read -r ver sum link <<<"$line"
+  [[ -n "${link:-}" ]] || { printf 'no Fedora %s ISO in releases.json\n' "$1" >&2; return 1; }
+  iso_set "$link" "${link##*/}" "$sum" sha256 "$ver"
+}
+
+iso_resolve_fedora_server() { fedora_resolve Server 'Server-dvd-x86_64.*\.iso$'; }
+
+iso_resolve_opensuse_leap() {
+  local v base file sum
+  v=$(iso_fetch https://get.opensuse.org/api/v0/distributions.json | perl -MJSON::PP -e '
+    my $d = decode_json(join "", <STDIN>);
+    my ($b) = sort { $b->{version} <=> $a->{version} } grep { $_->{state} eq "Stable" } @{$d->{Leap}};
+    print $b->{version} if $b;') || return 1
+  [[ "$v" =~ ^[0-9]+\.[0-9]+$ ]] || { printf 'cannot read the Leap version\n' >&2; return 1; }
+  base="https://download.opensuse.org/distribution/leap/${v}/offline/"
+  file="Leap-${v}-offline-installer-x86_64.install.iso"
+  sum=$(iso_fetch "${base}${file}.sha512" | awk '{ print $1; exit }') || return 1
+  iso_set "${base}${file}" "$file" "$sum" sha512 "$v"
+}
+
+iso_resolve_alpine() {
+  local base="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/" line file sum
+  line=$(iso_fetch "${base}latest-releases.yaml" | awk '
+    /^-/ { if (flv == "alpine-virt") { print sha, file }; flv = ""; file = ""; sha = "" }
+    $1 == "flavor:" { flv = $2 } $1 == "file:" { file = $2 } $1 == "sha256:" { sha = $2 }
+    END { if (flv == "alpine-virt") print sha, file }') || return 1
+  read -r sum file <<<"$line"
+  [[ -n "${file:-}" ]] || { printf 'no alpine-virt ISO in latest-releases.yaml\n' >&2; return 1; }
+  iso_set "${base}${file}" "$file" "$sum" sha256 "$(sed -n 's/^alpine-virt-\([0-9.]*\)-.*/\1/p' <<<"$file")"
+}
+
+iso_resolve_proxmox_ve() {
+  iso_from_list "https://enterprise.proxmox.com/iso/" SHA256SUMS gnu \
+    '^proxmox-ve_[0-9.]+-[0-9]+\.iso$' 's/^proxmox-ve_\([0-9.]*-[0-9]*\)\.iso/\1/p'
+}
+
+iso_resolve_proxmox_backup() {
+  iso_from_list "https://enterprise.proxmox.com/iso/" SHA256SUMS gnu \
+    '^proxmox-backup-server_[0-9.]+-[0-9]+\.iso$' 's/^proxmox-backup-server_\([0-9.]*-[0-9]*\)\.iso/\1/p'
+}
+
+# ---- desktop ------------------------------------------------------------------
+
+iso_resolve_ubuntu_desktop() { ubuntu_resolve desktop; }
+
+# kernel.org's Linux Mint mirror is on Mint's official mirror list.
+iso_resolve_linuxmint() {
+  local base="https://mirrors.edge.kernel.org/linuxmint/stable/" v
+  v=$(iso_fetch "$base" | grep -oE 'href="[0-9]+(\.[0-9]+)?/"' | grep -oE '[0-9]+(\.[0-9]+)?' | sort -V | tail -n 1) || return 1
+  [[ -n "$v" ]] || { printf 'cannot read the Linux Mint version\n' >&2; return 1; }
+  iso_from_list "${base}${v}/" sha256sum.txt gnu \
+    "^linuxmint-${v//./\\.}-cinnamon-64bit\\.iso\$" 's/^linuxmint-\([0-9.]*\)-.*/\1/p'
+}
+
+iso_resolve_fedora_workstation() { fedora_resolve Workstation 'Workstation-Live.*x86_64\.iso$'; }
+
+# Pop!_OS publishes the current build, with its checksum, through its API.
+popos_resolve() {   # <channel: intel | nvidia>
+  local line url sum ver
+  line=$(iso_fetch "https://api.pop-os.org/builds/24.04/$1" | perl -MJSON::PP -e '
+    my $d = decode_json(join "", <STDIN>); print "$d->{url} $d->{sha_sum} $d->{version}\n";') || return 1
+  read -r url sum ver <<<"$line"
+  iso_set "$url" "${url##*/}" "$sum" sha256 "$ver"
+}
+
+iso_resolve_popos() { popos_resolve intel; }
+iso_resolve_popos_nvidia() { popos_resolve nvidia; }
+
+iso_resolve_manjaro() {
+  local url sum
+  url=$(iso_fetch https://manjaro.org/products/download/x86 |
+    grep -oE 'https://download\.manjaro\.org/kde/[0-9.]+/manjaro-kde-[^"]+\.iso' | sort -uV | tail -n 1) || return 1
+  [[ -n "$url" ]] || { printf 'no Manjaro KDE ISO on the download page\n' >&2; return 1; }
+  sum=$(iso_fetch "${url}.sha256" | awk '{ print $1; exit }') || return 1
+  iso_set "$url" "${url##*/}" "$sum" sha256 "$(sed -n 's#.*/kde/\([0-9.]*\)/.*#\1#p' <<<"$url")"
+}
+
+# MX Linux releases are hosted on SourceForge; its RSS feed lists them.
+iso_resolve_mxlinux() {
+  local file sf="https://sourceforge.net/projects/mx-linux/files/Final/Xfce"
+  file=$(iso_fetch 'https://sourceforge.net/projects/mx-linux/rss?path=/Final/Xfce' |
+    grep -oE '/Final/Xfce/MX-[0-9.]+_Xfce_x64\.iso' | sed 's#.*/##' | sort -uV | tail -n 1) || return 1
+  [[ -n "$file" ]] || { printf 'no MX Linux Xfce ISO in the SourceForge feed\n' >&2; return 1; }
+  iso_set "${sf}/${file}/download" "$file" \
+    "$(iso_fetch "${sf}/${file}.sha256/download" | awk '{ print $1; exit }')" sha256 \
+    "$(sed -n 's/^MX-\([0-9.]*\)_.*/\1/p' <<<"$file")"
+}
+
+# mirror.alpix.eu is on EndeavourOS's official mirror list.
+iso_resolve_endeavouros() {
+  local base="https://mirror.alpix.eu/endeavouros/iso/" file
+  file=$(iso_fetch "$base" | grep -oE 'EndeavourOS_[A-Za-z0-9-]+-[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.iso' |
+    sort -u | awk -F- '{ print $NF, $0 }' | sort | tail -n 1 | cut -d' ' -f2) || return 1
+  [[ -n "$file" ]] || { printf 'no EndeavourOS ISO on the mirror\n' >&2; return 1; }
+  iso_set "${base}${file}" "$file" "$(iso_fetch "${base}${file}.sha512sum" | awk '{ print $1; exit }')" sha512 \
+    "$(sed -n 's/.*-\([0-9.]*\)\.iso$/\1/p' <<<"$file")"
+}
+
+iso_resolve_opensuse_tumbleweed() {
+  local base="https://download.opensuse.org/tumbleweed/iso/" sum file
+  read -r sum file < <(iso_fetch "${base}openSUSE-Tumbleweed-DVD-x86_64-Current.iso.sha256" && echo) || [[ -n "${file:-}" ]] || return 1
+  iso_set "${base}${file}" "$file" "$sum" sha256 "$(sed -n 's/.*Snapshot\([0-9]*\).*/\1/p' <<<"$file")"
+}
+
+iso_resolve_archlinux() {
+  iso_from_list "https://geo.mirror.pkgbuild.com/iso/latest/" sha256sums.txt gnu \
+    '^archlinux-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-x86_64\.iso$' 's/^archlinux-\([0-9.]*\)-.*/\1/p'
+}
+
+# The newest stable NixOS channel that has a graphical ISO (YY.05 / YY.11).
+iso_resolve_nixos() {
+  local y m v="" sum file url
+  y=$(date +%y)
+  for c in "$y.11" "$y.05" "$((y - 1)).11" "$((y - 1)).05"; do
+    if curl -fs -o /dev/null --max-time 15 "https://channels.nixos.org/nixos-${c}/latest-nixos-graphical-x86_64-linux.iso.sha256"; then
+      v=$c
+      break
+    fi
+  done
+  [[ -n "$v" ]] || { printf 'no current NixOS channel found\n' >&2; return 1; }
+  m="https://channels.nixos.org/nixos-${v}/latest-nixos-graphical-x86_64-linux.iso"
+  read -r sum file < <(iso_fetch "${m}.sha256" && echo) || [[ -n "${file:-}" ]] || return 1
+  url=$(curl -fsSI --max-time 30 "$m" | sed -n 's/^[Ll]ocation: *\(https:[^[:space:]]*\).*/\1/p' | tail -n 1)
+  [[ -n "$url" && "${url##*/}" == "$file" ]] || { printf 'cannot find the NixOS %s ISO\n' "$v" >&2; return 1; }
+  iso_set "$url" "$file" "$sum" sha256 "$v"
+}
+
+iso_resolve_kali() {
+  iso_from_list "https://cdimage.kali.org/current/" SHA256SUMS gnu \
+    '^kali-linux-[0-9.]+-installer-amd64\.iso$' 's/^kali-linux-\([0-9.]*\)-.*/\1/p'
+}
+
+# ---- gaming -------------------------------------------------------------------
+
+cachyos_resolve() {   # <edition: desktop | handheld>
+  local url file d
+  url=$(iso_fetch https://cachyos.org/download/ |
+    grep -oE "https://iso\\.cachyos\\.org/$1/[0-9]+/cachyos-$1-linux-[0-9]+\\.iso" | sort -uV | tail -n 1) || return 1
+  [[ -n "$url" ]] || { printf 'no CachyOS %s ISO on the download page\n' "$1" >&2; return 1; }
+  file=${url##*/}
+  d=$(sed -n 's/.*-linux-\([0-9]*\)\.iso/\1/p' <<<"$file")
+  iso_set "$url" "$file" \
+    "$(iso_fetch "https://cdn77.cachyos.org/ISO/$1/${d}/${file}.sha256" | awk '{ print $1; exit }')" sha256 "$d"
+}
+
+iso_resolve_cachyos() { cachyos_resolve desktop; }
+iso_resolve_cachyos_handheld() { cachyos_resolve handheld; }
+
+# Bazzite's ISOs keep one name per edition; the build date (from the
+# server's Last-Modified) goes into the saved name.
+bazzite_resolve() {   # <image name>
+  local url="https://download.bazzite.gg/$1.iso" sum lm d
+  sum=$(iso_fetch "${url}-CHECKSUM" | awk '{ print $1; exit }') || return 1
+  lm=$(curl -fsSI --max-time 30 "$url" | sed -n 's/^[Ll]ast-[Mm]odified: *//p' | tr -d '\r')
+  d=$(date -u -d "$lm" +%Y%m%d 2>/dev/null) || d=$(date -u +%Y%m%d)
+  iso_set "$url" "$1-${d}.iso" "$sum" sha256 "$d"
+}
+
+iso_resolve_bazzite() { bazzite_resolve bazzite-stable-amd64; }
+iso_resolve_bazzite_nvidia() { bazzite_resolve bazzite-nvidia-open-stable-amd64; }
+iso_resolve_bazzite_deck() { bazzite_resolve bazzite-deck-stable-amd64; }
+
+iso_resolve_nobara() {
+  local url
+  url=$(iso_fetch https://nobaraproject.org/download-nobara/ |
+    grep -oE 'https://nobara-images\.nobaraproject\.org/Nobara-[0-9]+-KDE-[0-9-]+\.iso' | sort -uV | tail -n 1) || return 1
+  [[ -n "$url" ]] || { printf 'no Nobara KDE ISO on the download page\n' >&2; return 1; }
+  iso_set "$url" "${url##*/}" "$(iso_fetch "${url}.sha256sum" | awk '{ print $1; exit }')" sha256 \
+    "$(sed -n 's/.*Nobara-\([0-9]*\)-KDE-\(.*\)\.iso/\1 (\2)/p' <<<"$url")"
+}
+
+iso_resolve_garuda_gaming() {
+  local base="https://iso.builds.garudalinux.org/iso/latest/garuda/dr460nized-gaming/" sum file url
+  read -r sum file < <(iso_fetch "${base}latest.iso.sha256" && echo) || [[ -n "${file:-}" ]] || return 1
+  url=$(curl -fsSI --max-time 30 "${base}latest.iso" | sed -n 's/^[Ll]ocation: *\(https:[^[:space:]]*\).*/\1/p' | tail -n 1)
+  [[ -n "$url" && "${url##*/}" == "$file" ]] || url="${base}latest.iso"
+  iso_set "$url" "$file" "$sum" sha256 "$(sed -n 's/.*-\([0-9]*\)\.iso$/\1/p' <<<"$file")"
+}
