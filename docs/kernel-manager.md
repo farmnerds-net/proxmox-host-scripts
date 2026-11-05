@@ -8,10 +8,17 @@ the drivers your hardware uses, and which old kernels only take up space.
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/farmnerds-net/proxmox-host-scripts/main/kernel-manager.sh)"
 ```
 
-Run it on the Proxmox host shell as root. **This version only reports; it
-changes nothing.** Trying a kernel for one boot, pinning, installing other
-kernel series and removing old kernels are coming next, built on Proxmox's
-own `proxmox-boot-tool`.
+Run it on the Proxmox host shell as root. It shows the report, then offers
+to **try a kernel for one boot**, **pin** or **unpin** one, all through
+Proxmox's own `proxmox-boot-tool`. **It never reboots the host**: changes
+take effect when you reboot. (Installing other kernel series and removing
+old kernels are coming next.)
+
+For the report alone, which changes nothing:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/farmnerds-net/proxmox-host-scripts/main/kernel-manager.sh)" -- --report
+```
 
 ## What it shows
 
@@ -20,6 +27,8 @@ Kernel
   Running:      7.0.14-28-pve (up 23 hours)
   Next boot:    7.0.14-28-pve (the newest bootable kernel; nothing is pinned)
   Boot loader:  systemd-boot (UEFI), managed by proxmox-boot-tool on 1 boot partition
+  Pinned:       none
+  Boot menu:    shows for 3 seconds; default: the newest kernel
 
 Installed kernels
   VERSION           BOOTABLE  SIZE     NOTES
@@ -97,3 +106,51 @@ inside the package); that comes with installing other series.
 Old kernel builds stay installed after updates (about 1 GB each). The
 report lists the ones that aren't running, pinned, next to boot or the
 fallback, and how much space removing them would free. Nothing is removed.
+
+## Trying, pinning and unpinning
+
+After the report, pick what to do. Every screen has **Back**; the first
+has **Exit**. Kernels with missing drivers are marked in the list, and you
+get an extra warning before choosing one.
+
+| Action | What it does |
+| --- | --- |
+| **Try a kernel for the next boot only** | The safest way to test a kernel: the next boot starts it once, then the host goes back to normal |
+| **Pin a kernel** | Keep booting it, also after kernel updates (they're still installed, just not started) |
+| **Keep the running kernel** | Shown when you're running an older kernel (for example after a trial): pin it |
+| **Remove the pin** | Boot the newest kernel again and follow updates as usual |
+| **Cancel the next-boot trial** | Undo a trial you set but haven't rebooted into yet |
+
+After each change the script reads the boot loader's actual default from
+the boot partition and shows it, so you can see the change took.
+
+### What happens if a trial kernel has problems
+
+How Proxmox's one-boot trial works: the trial kernel becomes the boot
+loader's default, and **after it has booted**, Proxmox's
+`proxmox-boot-cleanup` service removes the trial again. So:
+
+- **The trial kernel boots but something doesn't work** (a driver,
+  passthrough, a VM won't start): **just reboot once more.** The cleanup
+  already ran, and the host is back on its normal kernel.
+- **The trial kernel doesn't start at all** (it hangs or panics before the
+  system is up): the cleanup can't run, so the host keeps trying it. Then,
+  at the console, **choose your previous kernel in the boot menu** (it shows
+  for a few seconds at startup; the report says how long), and once it's
+  up, run the script with `--cancel-try`.
+
+The second case is rare, but it's why you need console access (a screen,
+IPMI or similar) when you try a kernel, and why **trying first, then
+pinning** is the safe order.
+
+### Without menus
+
+```bash
+kernel-manager.sh --try 6.17.13-21-pve   # start this kernel on the next boot only
+kernel-manager.sh --pin 7.0.14-26-pve    # keep booting this kernel
+kernel-manager.sh --unpin                # remove the pin and any trial
+kernel-manager.sh --cancel-try           # remove only the next-boot trial
+```
+
+The kernel must be installed. Presets for the menus: `KM_ACTION`
+(`try`, `pin`, `keep`, `unpin`, `cancel-try`), `KM_KERNEL`, `KM_CONFIRM=yes`.
