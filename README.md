@@ -12,6 +12,7 @@ behave the same.
 | --- | --- |
 | [iso-download](docs/iso-download.md) | Download a Linux ISO (server, desktop or gaming) to a storage, from the official site, checksum-verified, with a progress meter |
 | [cpu-governor](docs/cpu-governor.md) | Detect the CPU and how it scales, pick a Performance / Balanced / Power saver profile that survives reboots, undo it; checks microcode |
+| [kernel-manager](docs/kernel-manager.md) | Report the running, next-boot, installed and available kernels, check each against your hardware's drivers, and find old kernels to remove (read-only for now) |
 
 ## Usage
 
